@@ -1,0 +1,115 @@
+{
+  "description": "Procmon PMC Configuration Template",
+  "destructive_filter": true,
+  "history_depth": 5,
+  "autoscroll": true,
+  "logfile": "",
+  "columns": {
+    "map": [
+      "time_of_day",
+      "process_name",
+      "pid",
+      "operation",
+      "path",
+      "result"
+    ]
+  },
+  "filter_rules": [
+    {
+      "column": "process_name",
+      "relation": "is",
+      "value": "System",
+      "action": "exclude",
+      "comment": "Exclude System process"
+    },
+    {
+      "column": "process_name",
+      "relation": "contains",
+      "value": "chrome.exe",
+      "action": "include",
+      "comment": "Include Chrome browser events"
+    },
+    {
+      "column": "path",
+      "relation": "contains",
+      "value": "C:\\Users\\",
+      "action": "include",
+      "comment": "Include user directory access"
+    },
+    {
+      "column": "operation",
+      "relation": "is",
+      "value": "Process Create",
+      "action": "include",
+      "comment": "Include process creation events"
+    },
+    {
+      "column": "result",
+      "relation": "is_not",
+      "value": "SUCCESS",
+      "action": "include",
+      "comment": "Include failed operations"
+    }
+  ],
+  "highlight_rules": [
+    {
+      "column": "result",
+      "relation": "contains",
+      "value": "DENIED",
+      "action": "include",
+      "comment": "Highlight access denied events"
+    },
+    {
+      "column": "operation",
+      "relation": "is",
+      "value": "Process Create",
+      "action": "include",
+      "comment": "Highlight process creation"
+    }
+  ],
+  "_help": {
+    "columns": [
+      "date_and_time",
+      "process_name",
+      "pid",
+      "operation",
+      "result",
+      "detail",
+      "sequence",
+      "company",
+      "description",
+      "command_line",
+      "user",
+      "image_path",
+      "session",
+      "path",
+      "tid",
+      "relative_time",
+      "duration",
+      "time_of_day",
+      "version",
+      "event_class",
+      "authentication_id",
+      "virtualized",
+      "integrity",
+      "category",
+      "parent_pid",
+      "architecture",
+      "completion_time"
+    ],
+    "relations": [
+      "is",
+      "is_not",
+      "less_than",
+      "more_than",
+      "begins_with",
+      "ends_with",
+      "contains",
+      "excludes"
+    ],
+    "actions": [
+      "include",
+      "exclude"
+    ]
+  }
+}
