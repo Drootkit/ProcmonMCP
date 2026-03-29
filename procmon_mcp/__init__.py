@@ -37,5 +37,11 @@ from .formatters import _get_formatted_event_details
 # Server infrastructure
 from .server import mcp, _check_loaded, tool_decorator
 
+# PMC Configuration module
+from . import pmc_config
+
+# Capture control module
+from . import capture
+
 # Force tool registration by importing the tools module
 from . import tools as _tools  # noqa: F401

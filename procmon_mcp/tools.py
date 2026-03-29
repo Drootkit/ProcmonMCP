@@ -961,3 +961,593 @@ async def export_query_results(
         await ctx.error(f"[export_query_results] Failed: {e}")
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error exporting events: {e}")
+
+
+# ---- Procmon Capture Tools ----
+
+@tool_decorator
+async def generate_capture_config(
+    process_filter: str = "loader",
+    relation: str = "contains",
+    action: str = "include",
+    destructive_filter: bool = True,
+    history_depth: int = 10,
+    *, ctx: Context
+) -> Dict[str, Any]:
+    """
+    Generates a Procmon capture configuration JSON based on the specified process filter.
+
+    The configuration uses a template similar to malware_mon.json, with the first filter rule
+    customized to capture events from processes matching the specified filter.
+
+    Args:
+        process_filter: Process name to filter (default: "loader")
+        relation: Relation type - is, is_not, contains, begins_with, ends_with (default: "contains")
+        action: Filter action - include or exclude (default: "include")
+        destructive_filter: Whether to drop events that don't match filters (default: True)
+        history_depth: Maximum events in millions (default: 10)
+
+    Returns:
+        Dictionary containing the generated configuration JSON
+    """
+    await ctx.info(f"[generate_capture_config] Generating config for process filter: '{process_filter}'")
+
+    try:
+        from .pmc_config import generate_capture_config as _generate_config, check_procmon_parser_available
+
+        # Check procmon_parser availability
+        available, error = check_procmon_parser_available()
+        if not available:
+            await ctx.error(f"[generate_capture_config] procmon_parser not available: {error}")
+            raise RuntimeError(f"procmon_parser not available: {error}")
+
+        # Generate configuration
+        config = _generate_config(
+            process_filter=process_filter,
+            relation=relation,
+            action=action,
+            destructive_filter=destructive_filter,
+            history_depth=history_depth
+        )
+
+        result = {
+            "success": True,
+            "config": config,
+            "process_filter": process_filter,
+            "relation": relation,
+            "action": action,
+            "message": f"Configuration generated for process '{process_filter}' with relation '{relation}'"
+        }
+
+        await ctx.info(f"[generate_capture_config] Configuration generated successfully")
+        return result
+
+    except Exception as e:
+        await ctx.error(f"[generate_capture_config] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Failed to generate capture configuration: {e}")
+
+
+@tool_decorator
+async def generate_pmc_file(
+    config_json: Optional[Dict[str, Any]] = None,
+    process_filter: str = "loader",
+    relation: str = "contains",
+    output_path: Optional[str] = None,
+    *, ctx: Context
+) -> Dict[str, Any]:
+    """
+    Generates a PMC (Procmon Configuration) file from JSON configuration.
+
+    If config_json is provided, uses it directly. Otherwise, generates a default
+    configuration for the specified process filter.
+
+    Args:
+        config_json: Optional pre-built configuration JSON
+        process_filter: Process name filter if generating default config (default: "loader")
+        relation: Relation type if generating default config (default: "contains")
+        output_path: Output PMC file path (default: <timestamp>_<filter>.pmc)
+
+    Returns:
+        Dictionary with success status and output file path
+    """
+    await ctx.info(f"[generate_pmc_file] Starting PMC file generation")
+
+    try:
+        from .pmc_config import (
+            save_pmc_file, generate_capture_config,
+            generate_default_output_filename, check_procmon_parser_available
+        )
+
+        # Check procmon_parser availability
+        available, error = check_procmon_parser_available()
+        if not available:
+            await ctx.error(f"[generate_pmc_file] procmon_parser not available: {error}")
+            raise RuntimeError(f"procmon_parser not available: {error}")
+
+        # Generate config if not provided
+        if config_json is None:
+            config_json = generate_capture_config(
+                process_filter=process_filter,
+                relation=relation
+            )
+
+        # Generate output path if not provided
+        if output_path is None:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            safe_filter = "".join(c if c.isalnum() or c in "_-" else "_" for c in process_filter)
+            output_path = f"{timestamp}_{safe_filter}.pmc"
+
+        # Save PMC file
+        result = save_pmc_file(config_json, output_path)
+
+        if result["success"]:
+            await ctx.info(f"[generate_pmc_file] PMC file saved to: {result['output_path']}")
+        else:
+            await ctx.error(f"[generate_pmc_file] Failed: {result.get('error', 'Unknown error')}")
+
+        return result
+
+    except Exception as e:
+        await ctx.error(f"[generate_pmc_file] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Failed to generate PMC file: {e}")
+
+
+@tool_decorator
+async def start_procmon_capture(
+    pmc_file_path: str,
+    runtime_seconds: int = 60,
+    output_pml: Optional[str] = None,
+    procmon_path: Optional[str] = None,
+    wait_for_completion: bool = True,
+    *, ctx: Context
+) -> Dict[str, Any]:
+    """
+    Starts a Procmon capture session with the specified configuration.
+
+    Executes: Procmon64.exe /AcceptEula /Quiet /LoadConfig "PMC_PATH" /Runtime SECONDS /BackingFile "OUTPUT.PML"
+
+    Args:
+        pmc_file_path: Path to PMC configuration file
+        runtime_seconds: Capture duration in seconds (default: 60)
+        output_pml: Output PML file path (default: <timestamp>_<filter>.PML)
+        procmon_path: Path to Procmon executable (auto-detected if None)
+        wait_for_completion: Whether to wait for capture to complete (default: True)
+
+    Returns:
+        Dictionary with capture status and details
+    """
+    await ctx.info(f"[start_procmon_capture] Starting capture with PMC: {pmc_file_path}, runtime: {runtime_seconds}s")
+
+    try:
+        from .capture import start_procmon_capture as _start_capture, find_procmon_executable
+        from .pmc_config import generate_default_output_filename
+
+        # Validate PMC file
+        if not os.path.exists(pmc_file_path):
+            await ctx.error(f"[start_procmon_capture] PMC file not found: {pmc_file_path}")
+            raise FileNotFoundError(f"PMC file not found: {pmc_file_path}")
+
+        # Find Procmon executable
+        if procmon_path is None:
+            procmon_path = find_procmon_executable()
+
+        if procmon_path is None:
+            await ctx.error("[start_procmon_capture] Procmon executable not found")
+            raise RuntimeError("Procmon executable not found. Please install Procmon or specify procmon_path.")
+
+        # Generate default output path if not provided
+        if output_pml is None:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            output_pml = f"{timestamp}_capture.PML"
+
+        await ctx.info(f"[start_procmon_capture] Procmon path: {procmon_path}")
+        await ctx.info(f"[start_procmon_capture] Output PML: {output_pml}")
+
+        # Start capture
+        if wait_for_completion:
+            await ctx.info(f"[start_procmon_capture] Waiting for {runtime_seconds}s capture to complete...")
+
+        result = _start_capture(
+            pmc_file_path=pmc_file_path,
+            output_pml=output_pml,
+            runtime_seconds=runtime_seconds,
+            procmon_path=procmon_path,
+            wait_for_completion=wait_for_completion
+        )
+
+        if result["success"]:
+            await ctx.info(f"[start_procmon_capture] Capture completed successfully")
+        else:
+            await ctx.error(f"[start_procmon_capture] Capture failed: {result.get('error', 'Unknown error')}")
+
+        return result
+
+    except Exception as e:
+        await ctx.error(f"[start_procmon_capture] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Failed to start Procmon capture: {e}")
+
+
+@tool_decorator
+async def quick_capture(
+    process_filter: str = "loader",
+    relation: str = "contains",
+    runtime_seconds: int = 60,
+    output_dir: Optional[str] = None,
+    *, ctx: Context
+) -> Dict[str, Any]:
+    """
+    Convenience function to perform a complete capture workflow:
+    1. Generate configuration JSON
+    2. Create PMC file
+    3. Start Procmon capture
+    4. Wait for completion
+
+    Args:
+        process_filter: Process name to capture (default: "loader")
+        relation: Relation type (default: "contains")
+        runtime_seconds: Capture duration in seconds (default: 60)
+        output_dir: Directory for output files (default: current directory)
+
+    Returns:
+        Dictionary with complete capture results including output file path
+    """
+    await ctx.info(f"[quick_capture] Starting quick capture for '{process_filter}' ({runtime_seconds}s)")
+
+    try:
+        from .pmc_config import generate_capture_config, save_pmc_file, check_procmon_parser_available
+        from .capture import start_procmon_capture as _start_capture, find_procmon_executable
+
+        # Check dependencies
+        available, error = check_procmon_parser_available()
+        if not available:
+            await ctx.error(f"[quick_capture] procmon_parser not available: {error}")
+            raise RuntimeError(f"procmon_parser not available: {error}")
+
+        # Find Procmon
+        procmon_path = find_procmon_executable()
+        if procmon_path is None:
+            await ctx.error("[quick_capture] Procmon executable not found")
+            raise RuntimeError("Procmon executable not found")
+
+        # Setup output paths
+        if output_dir is None:
+            output_dir = os.getcwd()
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        safe_filter = "".join(c if c.isalnum() or c in "_-" else "_" for c in process_filter)
+        base_name = f"{timestamp}_{safe_filter}"
+        pmc_path = os.path.join(output_dir, f"{base_name}.pmc")
+        pml_path = os.path.join(output_dir, f"{base_name}.PML")
+
+        # Step 1: Generate config
+        await ctx.info("[quick_capture] Step 1: Generating configuration...")
+        config = generate_capture_config(
+            process_filter=process_filter,
+            relation=relation
+        )
+
+        # Step 2: Save PMC file
+        await ctx.info(f"[quick_capture] Step 2: Saving PMC file to {pmc_path}...")
+        pmc_result = save_pmc_file(config, pmc_path)
+        if not pmc_result["success"]:
+            raise RuntimeError(f"Failed to save PMC file: {pmc_result.get('error')}")
+
+        # Step 3: Start capture
+        await ctx.info(f"[quick_capture] Step 3: Starting Procmon capture for {runtime_seconds}s...")
+        capture_result = _start_capture(
+            pmc_file_path=pmc_path,
+            output_pml=pml_path,
+            runtime_seconds=runtime_seconds,
+            procmon_path=procmon_path,
+            wait_for_completion=True
+        )
+
+        result = {
+            "success": capture_result["success"],
+            "process_filter": process_filter,
+            "relation": relation,
+            "runtime_seconds": runtime_seconds,
+            "pmc_file": pmc_path,
+            "pml_file": pml_path,
+            "config": config,
+            "capture_result": capture_result
+        }
+
+        if capture_result["success"]:
+            await ctx.info(f"[quick_capture] Capture completed. Output: {pml_path}")
+        else:
+            await ctx.error(f"[quick_capture] Capture failed: {capture_result.get('error')}")
+
+        return result
+
+    except Exception as e:
+        await ctx.error(f"[quick_capture] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Failed to complete quick capture: {e}")
+
+
+# ---- Process Execution Tools ----
+
+@tool_decorator
+async def launch_process(
+    executable_path: str,
+    arguments: Optional[str] = None,
+    working_directory: Optional[str] = None,
+    wait_for_completion: bool = False,
+    timeout_seconds: int = 300,
+    hidden: bool = False,
+    *, ctx: Context
+) -> Dict[str, Any]:
+    """
+    Launches a process by executing the specified executable file.
+    Simulates user double-clicking an executable.
+
+    This tool can be used to start a target process that you want to monitor with Procmon.
+    Use in combination with Procmon capture tools for complete analysis workflow.
+
+    Args:
+        executable_path: Full path to the executable file (.exe, .bat, .cmd, etc.)
+        arguments: Optional command line arguments to pass to the executable
+        working_directory: Optional working directory for the process
+        wait_for_completion: Whether to wait for the process to complete (default: False)
+        timeout_seconds: Timeout in seconds if waiting for completion (default: 300)
+        hidden: Whether to run the process without a visible window (default: False)
+
+    Returns:
+        Dictionary with launch status, PID, and process details
+
+    Example:
+        # Launch a process to monitor
+        launch_process(
+            executable_path="C:\\path\\to\\loader.exe",
+            arguments="--config test.ini",
+            wait_for_completion=False
+        )
+    """
+    await ctx.info(f"[launch_process] Launching: {executable_path}")
+
+    try:
+        from .capture import launch_process as _launch_process
+
+        # Validate executable path
+        if not os.path.exists(executable_path):
+            await ctx.error(f"[launch_process] Executable not found: {executable_path}")
+            raise FileNotFoundError(f"Executable not found: {executable_path}")
+
+        # Launch the process
+        result = _launch_process(
+            executable_path=executable_path,
+            arguments=arguments,
+            working_directory=working_directory,
+            wait_for_completion=wait_for_completion,
+            timeout_seconds=timeout_seconds,
+            hidden=hidden
+        )
+
+        if result["success"]:
+            pid_info = f" with PID {result.get('pid')}" if result.get('pid') else ""
+            await ctx.info(f"[launch_process] Process launched successfully{pid_info}")
+        else:
+            await ctx.error(f"[launch_process] Failed to launch: {result.get('error', 'Unknown error')}")
+
+        return result
+
+    except Exception as e:
+        await ctx.error(f"[launch_process] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Failed to launch process: {e}")
+
+
+@tool_decorator
+async def get_process_info(
+    pid: int,
+    *, ctx: Context
+) -> Dict[str, Any]:
+    """
+    Retrieves detailed information about a running process by PID.
+
+    Args:
+        pid: Process ID to query
+
+    Returns:
+        Dictionary with process information including:
+        - name, exe path, command line, working directory
+        - create time, CPU usage, memory usage
+    """
+    await ctx.info(f"[get_process_info] Querying process PID: {pid}")
+
+    try:
+        from .capture import get_process_info as _get_process_info
+
+        result = _get_process_info(pid)
+
+        if result.get("running"):
+            await ctx.info(f"[get_process_info] Process found: {result.get('name', 'Unknown')}")
+        else:
+            await ctx.warning(f"[get_process_info] Process not running or not accessible")
+
+        return result
+
+    except Exception as e:
+        await ctx.error(f"[get_process_info] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Failed to get process info: {e}")
+
+
+@tool_decorator
+async def terminate_process(
+    pid: int,
+    force: bool = True,
+    *, ctx: Context
+) -> Dict[str, Any]:
+    """
+    Terminates a running process by PID.
+
+    Args:
+        pid: Process ID to terminate
+        force: Whether to force termination (kill vs graceful terminate)
+
+    Returns:
+        Dictionary with termination status
+    """
+    await ctx.info(f"[terminate_process] Terminating PID: {pid} (force={force})")
+
+    try:
+        from .capture import terminate_process as _terminate_process
+
+        result = _terminate_process(pid, force=force)
+
+        if result["success"]:
+            await ctx.info(f"[terminate_process] Process {pid} terminated successfully")
+        else:
+            await ctx.error(f"[terminate_process] Failed: {result.get('error', 'Unknown error')}")
+
+        return result
+
+    except Exception as e:
+        await ctx.error(f"[terminate_process] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Failed to terminate process: {e}")
+
+
+@tool_decorator
+async def monitor_and_capture(
+    executable_path: str,
+    process_filter: Optional[str] = None,
+    arguments: Optional[str] = None,
+    capture_duration: int = 60,
+    output_dir: Optional[str] = None,
+    *, ctx: Context
+) -> Dict[str, Any]:
+    """
+    Complete workflow: Start Procmon capture, launch target process, wait, then stop.
+
+    This is a convenience tool that combines:
+    1. Generate PMC config for the process
+    2. Start Procmon capture
+    3. Launch the target process
+    4. Wait for capture to complete
+
+    Args:
+        executable_path: Path to the executable to launch and monitor
+        process_filter: Process name filter for Procmon (auto-detected from executable if None)
+        arguments: Optional arguments for the executable
+        capture_duration: Total capture duration in seconds (default: 60)
+        output_dir: Directory for output files (default: current directory)
+
+    Returns:
+        Dictionary with complete results including PML file path
+    """
+    await ctx.info(f"[monitor_and_capture] Starting monitoring for: {executable_path}")
+
+    try:
+        from .pmc_config import generate_capture_config, save_pmc_file, check_procmon_parser_available
+        from .capture import (
+            start_procmon_capture as _start_capture,
+            launch_process as _launch_process,
+            find_procmon_executable,
+            get_process_info
+        )
+        import time as time_module
+
+        # Validate executable
+        if not os.path.exists(executable_path):
+            await ctx.error(f"[monitor_and_capture] Executable not found: {executable_path}")
+            raise FileNotFoundError(f"Executable not found: {executable_path}")
+
+        # Auto-detect process filter from executable name
+        if process_filter is None:
+            process_filter = os.path.splitext(os.path.basename(executable_path))[0]
+
+        # Check dependencies
+        available, error = check_procmon_parser_available()
+        if not available:
+            raise RuntimeError(f"procmon_parser not available: {error}")
+
+        procmon_path = find_procmon_executable()
+        if procmon_path is None:
+            raise RuntimeError("Procmon executable not found")
+
+        # Setup output paths
+        if output_dir is None:
+            output_dir = os.getcwd()
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        safe_filter = "".join(c if c.isalnum() or c in "_-" else "_" for c in process_filter)
+        base_name = f"{timestamp}_{safe_filter}"
+        pmc_path = os.path.join(output_dir, f"{base_name}.pmc")
+        pml_path = os.path.join(output_dir, f"{base_name}.PML")
+
+        # Step 1: Generate and save config
+        await ctx.info("[monitor_and_capture] Step 1/4: Generating Procmon configuration...")
+        config = generate_capture_config(process_filter=process_filter)
+        pmc_result = save_pmc_file(config, pmc_path)
+        if not pmc_result["success"]:
+            raise RuntimeError(f"Failed to save PMC: {pmc_result.get('error')}")
+
+        # Step 2: Start Procmon capture (non-blocking)
+        await ctx.info(f"[monitor_and_capture] Step 2/4: Starting Procmon capture ({capture_duration}s)...")
+        capture_result = _start_capture(
+            pmc_file_path=pmc_path,
+            output_pml=pml_path,
+            runtime_seconds=capture_duration,
+            procmon_path=procmon_path,
+            wait_for_completion=False  # Non-blocking so we can launch the process
+        )
+
+        if not capture_result.get("success"):
+            raise RuntimeError(f"Failed to start Procmon: {capture_result.get('error')}")
+
+        # Wait a moment for Procmon to initialize
+        await ctx.info("[monitor_and_capture] Waiting for Procmon to initialize...")
+        time_module.sleep(2)
+
+        # Step 3: Launch the target process
+        await ctx.info(f"[monitor_and_capture] Step 3/4: Launching target process: {executable_path}")
+        launch_result = _launch_process(
+            executable_path=executable_path,
+            arguments=arguments,
+            wait_for_completion=False
+        )
+
+        launched_pid = launch_result.get("pid")
+
+        if launch_result["success"]:
+            await ctx.info(f"[monitor_and_capture] Process launched with PID: {launched_pid}")
+        else:
+            await ctx.warning(f"[monitor_and_capture] Process launch issue: {launch_result.get('error')}")
+
+        # Step 4: Wait for capture to complete
+        remaining_time = capture_duration - 3  # Account for initialization delay
+        if remaining_time > 0:
+            await ctx.info(f"[monitor_and_capture] Step 4/4: Waiting {remaining_time}s for capture to complete...")
+            time_module.sleep(remaining_time)
+
+        result = {
+            "success": True,
+            "executable_path": executable_path,
+            "process_filter": process_filter,
+            "arguments": arguments,
+            "capture_duration": capture_duration,
+            "pmc_file": pmc_path,
+            "pml_file": pml_path,
+            "launched_pid": launched_pid,
+            "launch_result": launch_result
+        }
+
+        # Check if output file was created
+        if os.path.exists(pml_path):
+            result["pml_file_size"] = os.path.getsize(pml_path)
+            await ctx.info(f"[monitor_and_capture] Complete! PML file: {pml_path} ({result['pml_file_size']} bytes)")
+        else:
+            result["warning"] = "PML file not yet created (capture may still be finalizing)"
+
+        return result
+
+    except Exception as e:
+        await ctx.error(f"[monitor_and_capture] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Failed to complete monitoring workflow: {e}")
